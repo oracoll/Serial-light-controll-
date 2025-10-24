@@ -48,7 +48,7 @@ const int EEPROM_FORCE_R6 = 2;
 const int EEPROM_DESIRED_STATE = 3;
 const int EEPROM_FIRST_PRESS = 4;
 const int EEPROM_REVERSE_LIGHT_MODE = 5; // 0=auto, 1=manual off
-const int EEPROM_CHECKBYTE = 10; // To check if EEPROM was initialized
+const int EEPROM_CHECKBYTE = 10;
 
 // timings
 const unsigned long HEARTBEAT_MS = 500;
@@ -62,6 +62,7 @@ unsigned long lastDebounceTime[4] = {0,0,0,0};
 
 // long press
 const unsigned long LONG_MS = 3000;
+const unsigned long SIMULTANEOUS_PRESS_DELAY = 200; // Delay to detect if btn3+btn4 pressed together
 unsigned long pressStart[4] = {0,0,0,0};
 bool held[4] = {false,false,false,false};
 
@@ -80,8 +81,8 @@ void stopBeepIfDue() {
   }
 }
 
-// relay desired state (we maintain local desired states so S packet is exact)
-uint8_t desiredState = 0x00; // bits 0..5 => R1..R6
+// relay desired state
+uint8_t desiredState = 0x00;
 
 // force flags
 bool forceR5 = false; // forced roof ON (via long press on btn3)
@@ -90,17 +91,16 @@ uint8_t reverseLightMode = 0; // 0=auto, 1=manual off
 
 // bypass
 bool bypassMode = false;
-bool firstPressInBypass = true; // Track if it's the first press after entering bypass
+bool firstPressInBypass = true;
 
 // Delayed button processing for bypass mode
 unsigned long btn1PressTime = 0;
 unsigned long btn2PressTime = 0;
 bool btn1Pending = false;
 bool btn2Pending = false;
-const unsigned long BYPASS_BUTTON_DELAY = 500; // 500ms delay before processing individual buttons in bypass
+const unsigned long BYPASS_BUTTON_DELAY = 500;
 
 // alerts
-// alertMode: 0 none, 1 headlight+door (3 beeps x5), 2 door+power (2 beeps x5)
 int alertMode = 0;
 int alertCount = 0;
 unsigned long alertTimer = 0;
@@ -109,10 +109,13 @@ const unsigned long ALERT_UNIT_MS = 200;
 
 // scheduled second beep for blocked events
 unsigned long schedSecondBeep = 0;
+unsigned long schedSecondBeep2 = 0;
 
-// button press waiting flags
-bool btn3PressedWaiting = false;
-bool btn4PressedWaiting = false;
+// button press tracking with simultaneous press detection
+bool btn3PressWaiting = false;
+bool btn4PressWaiting = false;
+unsigned long btn3PressTime = 0;
+unsigned long btn4PressTime = 0;
 
 // simultaneous press latches
 bool bypassLatched = false;
@@ -133,9 +136,7 @@ void saveStates() {
 
 // Load states from EEPROM
 void loadStates() {
-  // Check if EEPROM was initialized (first run)
   if (EEPROM.read(EEPROM_CHECKBYTE) != 0x55) {
-    // Initialize EEPROM
     EEPROM.update(EEPROM_BYPASS, 0);
     EEPROM.update(EEPROM_FORCE_R5, 0);
     EEPROM.update(EEPROM_FORCE_R6, 0);
@@ -165,12 +166,10 @@ bool sampleButton(uint8_t pin, int idx) {
     if (stable[idx] != raw) {
       stable[idx] = raw;
       if (stable[idx] == LOW) {
-        // pressed edge
         pressStart[idx] = millis();
         held[idx] = true;
         return true;
       } else {
-        // released
         held[idx] = false;
         return false;
       }
@@ -179,7 +178,7 @@ bool sampleButton(uint8_t pin, int idx) {
   return false;
 }
 
-// send heartbeat or commands
+// send heartbeat
 void sendHeartbeat() {
   if (millis() - lastHeartbeat >= HEARTBEAT_MS) {
     link.write('H');
@@ -191,7 +190,7 @@ void sendSetState() {
   link.write('S');
   link.write(desiredState & 0x3F);
   flashTxLed(6);
-  saveStates(); // Save state after any change
+  saveStates();
 }
 
 void flashTxLed(int ms) {
@@ -199,7 +198,6 @@ void flashTxLed(int ms) {
   ledTxUntil = millis() + ms;
 }
 
-// helper to send flasher toggle
 void sendFlasherToggle() {
   link.write('F');
 }
@@ -222,14 +220,11 @@ void setup() {
 
   link.begin(9600);
   
-  // Load saved states from EEPROM
   loadStates();
   
-  // Ensure relays are OFF on startup regardless of saved state
   desiredState = 0x00;
   sendSetState();
   
-  // small startup beep
   startBeep(2000, 40);
   lastHeartbeat = millis();
 }
@@ -237,10 +232,8 @@ void setup() {
 void loop() {
   unsigned long currentMillis = millis();
   
-  // update non-blocking tasks
   stopBeepIfDue();
   
-  // Clear TX LED if time expired
   if (ledTxUntil && currentMillis >= ledTxUntil) {
     digitalWrite(LED_STAT, LOW);
     ledTxUntil = 0;
@@ -258,16 +251,15 @@ void loop() {
 
   // Apply R6 mode based on settings
   if (forceR6) {
-    // Forced ON (long press)
     desiredState |= 0x20; // R6 ON
   } else if (reverseLightMode == 0) { // Auto mode
     if (revOn) {
-      desiredState |= 0x20; // R6 ON
+      desiredState |= 0x20;
     } else {
-      desiredState &= ~0x20; // R6 OFF
+      desiredState &= ~0x20;
     }
   } else { // Manual off mode
-    desiredState &= ~0x20; // R6 OFF
+    desiredState &= ~0x20;
   }
 
   // alerts: set mode when conditions start
@@ -286,7 +278,6 @@ void loop() {
       alertTimer = 0; 
     }
   } else {
-    // clear
     alertMode = 0;
     alertCount = 0;
     alertStep = 0;
@@ -299,19 +290,15 @@ void loop() {
     if (currentMillis - alertTimer >= ALERT_UNIT_MS) {
       alertTimer = currentMillis;
       if (alertMode == 1) {
-        // 3 short beeps then pause
         if (alertStep < 6) {
-          // even steps -> beep
           if ((alertStep % 2) == 0) startBeep(1600, 120);
           alertStep++;
         } else {
           alertStep = 0;
           alertCount++;
-          // long pause equal to 3 units -> skip by moving timer forward
           alertTimer += ALERT_UNIT_MS * 2;
         }
       } else if (alertMode == 2) {
-        // 2 beeps then pause
         if (alertStep < 4) {
           if ((alertStep % 2) == 0) startBeep(1200, 140);
           alertStep++;
@@ -330,32 +317,21 @@ void loop() {
   bool edge3 = sampleButton(BTN3, 2);
   bool edge4 = sampleButton(BTN4, 3);
 
-  // Track previous bypass mode to detect changes
-  static bool prevBypassMode = false;
-  
   // detect simultaneous press for bypass (1+2)
   if (stable[0] == LOW && stable[1] == LOW) {
     if (!bypassLatched) {
-      bool oldBypassMode = bypassMode; // Store old state
       bypassMode = !bypassMode;
       bypassLatched = true;
       
-      // Handle bypass mode changes
       if (bypassMode) {
-        // Entering bypass mode
         firstPressInBypass = true;
-        startBeep(2200, 120); // High pitch beep for entering bypass
-        
-        // Clear any pending button actions when entering bypass
+        startBeep(2200, 120);
         btn1Pending = false;
         btn2Pending = false;
       } else {
-        // Exiting bypass mode - turn off relays 1&2 and 3&4
-        desiredState &= ~(0x01 | 0x02 | 0x04 | 0x08); // Clear bits for R1,R2,R3,R4
+        desiredState &= ~(0x01 | 0x02 | 0x04 | 0x08);
         sendSetState();
-        startBeep(1800, 120); // Different pitch for exiting bypass
-        
-        // Clear any pending button actions when exiting bypass
+        startBeep(1800, 120);
         btn1Pending = false;
         btn2Pending = false;
       }
@@ -364,40 +340,30 @@ void loop() {
   } else {
     bypassLatched = false;
   }
-  
-  prevBypassMode = bypassMode;
 
   // Handle delayed button processing in bypass mode
   if (bypassMode) {
-    // If button 1 is pressed and we're not already processing it
     if (edge1 && !btn1Pending && !btn2Pending) {
       btn1PressTime = currentMillis;
       btn1Pending = true;
     }
     
-    // If button 2 is pressed and we're not already processing it  
     if (edge2 && !btn2Pending && !btn1Pending) {
       btn2PressTime = currentMillis;
       btn2Pending = true;
     }
     
-    // Check if button 1 delay has expired
     if (btn1Pending && (currentMillis - btn1PressTime >= BYPASS_BUTTON_DELAY)) {
       btn1Pending = false;
       
-      // Check if button 2 was also pressed during the delay period (simultaneous press)
       if (stable[1] == LOW) {
-        // Both buttons are pressed - this should trigger bypass exit, so ignore individual action
-        // The bypass mode handler above will take care of it
+        // Both buttons pressed - bypass exit handled above
       } else {
-        // Only button 1 was pressed - process it
         if (firstPressInBypass) {
-          // First press in bypass mode - just beep but don't toggle
           startBeep(1000, 60);
           firstPressInBypass = false;
           saveStates();
         } else {
-          // Normal operation in bypass mode
           bool newOn = !((desiredState & 0x01) || (desiredState & 0x02));
           if (newOn) {
             desiredState |= (0x01 | 0x02);
@@ -410,22 +376,17 @@ void loop() {
       }
     }
     
-    // Check if button 2 delay has expired
     if (btn2Pending && (currentMillis - btn2PressTime >= BYPASS_BUTTON_DELAY)) {
       btn2Pending = false;
       
-      // Check if button 1 was also pressed during the delay period (simultaneous press)
       if (stable[0] == LOW) {
-        // Both buttons are pressed - ignore individual action
+        // Both buttons pressed - bypass exit handled above
       } else {
-        // Only button 2 was pressed - process it
         if (firstPressInBypass) {
-          // First press in bypass mode - just beep but don't toggle
           startBeep(1000, 60);
           firstPressInBypass = false;
           saveStates();
         } else {
-          // Normal operation in bypass mode
           bool newOn = !((desiredState & 0x04) || (desiredState & 0x08));
           if (newOn) desiredState |= (0x04 | 0x08);
           else desiredState &= ~(0x04 | 0x08);
@@ -435,9 +396,8 @@ void loop() {
       }
     }
   } else {
-    // Not in bypass mode - process buttons immediately (normal operation)
+    // Normal mode - process buttons immediately
     
-    // BUTTON 1 pressed (edge) - normal mode
     if (edge1) {
       if (headOn) {
         bool newOn = !((desiredState & 0x01) || (desiredState & 0x02));
@@ -449,13 +409,11 @@ void loop() {
         sendSetState();
         startBeep(800, 90);
       } else {
-        // blocked -> schedule double low beep
         startBeep(700, 80);
         schedSecondBeep = currentMillis + 120;
       }
     }
 
-    // BUTTON 2 pressed (edge) - normal mode
     if (edge2) {
       if (headOn) {
         bool newOn = !((desiredState & 0x04) || (desiredState & 0x08));
@@ -470,98 +428,126 @@ void loop() {
     }
   }
 
-  // BUTTON 3 - Revised Logic
+  // ========== BUTTON 3 LOGIC ==========
+  // On press, start tracking with delay to detect simultaneous btn3+btn4
   if (edge3) {
-    // On press, record that we are waiting for a release or long press
-    btn3PressedWaiting = true;
+    btn3PressTime = currentMillis;
+    btn3PressWaiting = true;
   }
 
-  // Long press detection for Button 3
-  if (stable[2] == LOW && held[2] && !forceR5) {
-    if (currentMillis - pressStart[2] >= LONG_MS) {
-      forceR5 = true; // Enter forced mode
-      desiredState |= 0x10; // Turn on Relay 5
-      sendSetState();
-      startBeep(1500, 110); // Beep for forced on
-      held[2] = false; // Prevent re-triggering long press
-      btn3PressedWaiting = false; // Cancel any pending short press
-      saveStates();
-    }
-  }
-
-  // Short press release detection for Button 3
-  if (btn3PressedWaiting && stable[2] == HIGH) {
-    btn3PressedWaiting = false; // Handled
-    
-    if (forceR5) {
-      // If we are in forced mode, a short press turns it off.
-      forceR5 = false;
-      desiredState &= ~0x10; // Turn off Relay 5
-      sendSetState();
-      startBeep(1000, 90); // Beep for off
-      saveStates();
-    } else {
-      // Not in forced mode, check for interlock
-      if (headOn) {
-        // A0 has power, so toggle Relay 5
-        desiredState ^= 0x10;
+  // Check for simultaneous press btn3+btn4 with delay
+  if (btn3PressWaiting && currentMillis - btn3PressTime >= SIMULTANEOUS_PRESS_DELAY) {
+    if (stable[3] == LOW) {
+      // Both btn3 and btn4 are pressed - this is a flasher toggle, NOT relay action
+      btn3PressWaiting = false;
+      // Flasher toggle is handled in the btn3+btn4 section below
+    } else if (currentMillis - btn3PressTime >= LONG_MS) {
+      // Long press detected - force R5 ON
+      if (!forceR5) {
+        forceR5 = true;
+        desiredState |= 0x10;
         sendSetState();
-        startBeep(1000, 90); // Beep for toggle
-      } else {
-        // A0 has no power, do nothing but beep
-        startBeep(700, 80);
+        startBeep(1500, 110);
+        saveStates();
       }
+      btn3PressWaiting = false;
     }
   }
 
-  // BUTTON 4 - Revised Logic
-  if (edge4) {
-    btn4PressedWaiting = true;
-  }
-
-  // Long press detection for Button 4
-  if (stable[3] == LOW && held[3] && !forceR6) {
-    if (currentMillis - pressStart[3] >= LONG_MS) {
-      forceR6 = true; // Enter forced mode
-      sendSetState();
-      startBeep(1700, 110); // Beep for forced on
-      held[3] = false; // Prevent re-triggering
-      btn4PressedWaiting = false; // Cancel short press
-      saveStates();
-    }
-  }
-
-  // Short press release detection for Button 4
-  if (btn4PressedWaiting && stable[3] == HIGH) {
-    btn4PressedWaiting = false;
+  // Release detection for button 3
+  if (btn3PressWaiting && stable[2] == HIGH) {
+    btn3PressWaiting = false;
+    unsigned long pressDuration = currentMillis - btn3PressTime;
     
-    if (forceR6) {
-      // If in forced mode, a short press cancels it
-      forceR6 = false;
-      sendSetState();
-      startBeep(1200, 90);
-      saveStates();
-    } else {
-      // Toggle between auto (0) and manual off (1) modes
-      reverseLightMode = (reverseLightMode == 0) ? 1 : 0;
-      sendSetState();
-      // Beep to indicate the new mode
-      if (reverseLightMode == 0) {
-        startBeep(1200, 90); // Auto mode beep
+    // Only act if press was BEFORE long press threshold
+    if (pressDuration < LONG_MS) {
+      if (forceR5) {
+        // In forced mode - short press turns it off
+        forceR5 = false;
+        desiredState &= ~0x10;
+        sendSetState();
+        startBeep(1000, 90);
+        saveStates();
       } else {
-        startBeep(1400, 90); // Manual off mode beep
+        // Not in forced mode - check if headlights are on (A0 power)
+        if (headOn) {
+          // Toggle relay 5
+          desiredState ^= 0x10;
+          sendSetState();
+          startBeep(1000, 90);
+        } else {
+          // No power on A0 - blocked, beep only
+          startBeep(700, 80);
+          schedSecondBeep2 = currentMillis + 120;
+        }
       }
-      saveStates();
     }
   }
 
-  // Buttons 3+4 together -> flasher toggle
-  if (stable[2] == LOW && stable[3] == LOW) {
+  // ========== BUTTON 4 LOGIC ==========
+  // On press, start tracking with delay to detect simultaneous btn3+btn4
+  if (edge4) {
+    btn4PressTime = currentMillis;
+    btn4PressWaiting = true;
+  }
+
+  // Check for simultaneous press btn3+btn4 with delay
+  if (btn4PressWaiting && currentMillis - btn4PressTime >= SIMULTANEOUS_PRESS_DELAY) {
+    if (stable[2] == LOW) {
+      // Both btn3 and btn4 are pressed - this is a flasher toggle, NOT relay action
+      btn4PressWaiting = false;
+      // Flasher toggle is handled in the btn3+btn4 section below
+    } else if (currentMillis - btn4PressTime >= LONG_MS) {
+      // Long press detected - force R6 ON
+      if (!forceR6) {
+        forceR6 = true;
+        sendSetState();
+        startBeep(1700, 110);
+        saveStates();
+      }
+      btn4PressWaiting = false;
+    }
+  }
+
+  // Release detection for button 4
+  if (btn4PressWaiting && stable[3] == HIGH) {
+    btn4PressWaiting = false;
+    unsigned long pressDuration = currentMillis - btn4PressTime;
+    
+    // Only act if press was BEFORE long press threshold
+    if (pressDuration < LONG_MS) {
+      if (forceR6) {
+        // In forced mode - short press turns it off
+        forceR6 = false;
+        sendSetState();
+        startBeep(1200, 90);
+        saveStates();
+      } else {
+        // Not in forced mode - toggle between auto and manual off modes
+        reverseLightMode = (reverseLightMode == 0) ? 1 : 0;
+        sendSetState();
+
+        if (reverseLightMode == 0) {
+          startBeep(1200, 90); // Auto mode beep
+        } else {
+          startBeep(1400, 90); // Manual off mode beep
+        }
+        saveStates();
+      }
+    }
+  }
+
+  // Buttons 3+4 together -> flasher toggle (only after SIMULTANEOUS_PRESS_DELAY)
+  if (stable[2] == LOW && stable[3] == LOW &&
+      currentMillis - pressStart[2] >= SIMULTANEOUS_PRESS_DELAY &&
+      currentMillis - pressStart[3] >= SIMULTANEOUS_PRESS_DELAY) {
     if (!flasherLatched) {
       sendFlasherToggle();
       flashTxLed(6);
       startBeep(1800, 110);
       flasherLatched = true;
+      btn3PressWaiting = false;
+      btn4PressWaiting = false;
     }
   } else {
     flasherLatched = false;
@@ -571,6 +557,11 @@ void loop() {
   if (schedSecondBeep && currentMillis >= schedSecondBeep) {
     startBeep(700, 80);
     schedSecondBeep = 0;
+  }
+
+  if (schedSecondBeep2 && currentMillis >= schedSecondBeep2) {
+    startBeep(700, 80);
+    schedSecondBeep2 = 0;
   }
 
   // send heartbeat regularly

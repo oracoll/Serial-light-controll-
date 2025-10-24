@@ -47,7 +47,7 @@ const int EEPROM_FORCE_R5 = 1;
 const int EEPROM_FORCE_R6 = 2;
 const int EEPROM_DESIRED_STATE = 3;
 const int EEPROM_FIRST_PRESS = 4;
-const int EEPROM_REVERSE_MODE_ACTIVE = 5;
+const int EEPROM_REVERSE_LIGHT_MODE = 5; // 0=auto, 1=manual off
 const int EEPROM_CHECKBYTE = 10; // To check if EEPROM was initialized
 
 // timings
@@ -86,7 +86,7 @@ uint8_t desiredState = 0x00; // bits 0..5 => R1..R6
 // force flags
 bool forceR5 = false; // forced roof ON (via long press on btn3)
 bool forceR6 = false; // forced reverse ON (via long press on btn4)
-bool reverseModeActive = false; // toggled by btn4 short press
+uint8_t reverseLightMode = 0; // 0=auto, 1=manual off
 
 // bypass
 bool bypassMode = false;
@@ -128,7 +128,7 @@ void saveStates() {
   EEPROM.update(EEPROM_FORCE_R6, forceR6);
   EEPROM.update(EEPROM_DESIRED_STATE, desiredState);
   EEPROM.update(EEPROM_FIRST_PRESS, firstPressInBypass);
-  EEPROM.update(EEPROM_REVERSE_MODE_ACTIVE, reverseModeActive);
+  EEPROM.update(EEPROM_REVERSE_LIGHT_MODE, reverseLightMode);
 }
 
 // Load states from EEPROM
@@ -141,7 +141,7 @@ void loadStates() {
     EEPROM.update(EEPROM_FORCE_R6, 0);
     EEPROM.update(EEPROM_DESIRED_STATE, 0);
     EEPROM.update(EEPROM_FIRST_PRESS, 1);
-    EEPROM.update(EEPROM_REVERSE_MODE_ACTIVE, 0);
+    EEPROM.update(EEPROM_REVERSE_LIGHT_MODE, 0);
     EEPROM.update(EEPROM_CHECKBYTE, 0x55);
     return;
   }
@@ -151,7 +151,7 @@ void loadStates() {
   forceR6 = EEPROM.read(EEPROM_FORCE_R6);
   desiredState = EEPROM.read(EEPROM_DESIRED_STATE);
   firstPressInBypass = EEPROM.read(EEPROM_FIRST_PRESS);
-  reverseModeActive = EEPROM.read(EEPROM_REVERSE_MODE_ACTIVE);
+  reverseLightMode = EEPROM.read(EEPROM_REVERSE_LIGHT_MODE);
 }
 
 // helper: read & debounce button, return true when a new press (edge LOW) is detected
@@ -260,13 +260,13 @@ void loop() {
   if (forceR6) {
     // Forced ON (long press)
     desiredState |= 0x20; // R6 ON
-  } else if (reverseModeActive) {
+  } else if (reverseLightMode == 0) { // Auto mode
     if (revOn) {
       desiredState |= 0x20; // R6 ON
     } else {
       desiredState &= ~0x20; // R6 OFF
     }
-  } else {
+  } else { // Manual off mode
     desiredState &= ~0x20; // R6 OFF
   }
 
@@ -470,85 +470,87 @@ void loop() {
     }
   }
 
-  // NEW: Fixed Button 3 logic with proper interlock
-  // BUTTON 3 pressed (edge)
+  // BUTTON 3 - Revised Logic
   if (edge3) {
+    // On press, record that we are waiting for a release or long press
     btn3PressedWaiting = true;
   }
 
-  // BUTTON 3 long press handling (while button is held)
-  if (stable[2] == LOW) {
-    // Check for long press
-    if (held[2] && (currentMillis - pressStart[2] >= LONG_MS) && !forceR5) {
-      forceR5 = true;
-      desiredState |= 0x10; // set R5 ON
+  // Long press detection for Button 3
+  if (stable[2] == LOW && held[2] && !forceR5) {
+    if (currentMillis - pressStart[2] >= LONG_MS) {
+      forceR5 = true; // Enter forced mode
+      desiredState |= 0x10; // Turn on Relay 5
       sendSetState();
-      startBeep(1500, 110);
-      // ensure we only trigger once per hold:
-      held[2] = false; // suppress further long triggers until release
-      btn3PressedWaiting = false; // Prevent short press action after long press
+      startBeep(1500, 110); // Beep for forced on
+      held[2] = false; // Prevent re-triggering long press
+      btn3PressedWaiting = false; // Cancel any pending short press
       saveStates();
     }
   }
-  
-  // BUTTON 3 short press release (only if not handled as long press)
+
+  // Short press release detection for Button 3
   if (btn3PressedWaiting && stable[2] == HIGH) {
-    btn3PressedWaiting = false;
+    btn3PressedWaiting = false; // Handled
     
-    // If forceR5 is active, short press turns it off and returns to interlock
     if (forceR5) {
+      // If we are in forced mode, a short press turns it off.
       forceR5 = false;
-      desiredState &= ~0x10; // turn R5 off
+      desiredState &= ~0x10; // Turn off Relay 5
       sendSetState();
-      startBeep(1000, 90);
+      startBeep(1000, 90); // Beep for off
       saveStates();
     } else {
-      // Normal short press - check interlock conditions
+      // Not in forced mode, check for interlock
       if (headOn) {
-        // Headlights on or in bypass - toggle R5
-        desiredState ^= 0x10; // toggle R5
+        // A0 has power, so toggle Relay 5
+        desiredState ^= 0x10;
         sendSetState();
-        startBeep(1000, 90);
+        startBeep(1000, 90); // Beep for toggle
       } else {
-        // Headlights off and not in bypass - just beep to indicate no action
+        // A0 has no power, do nothing but beep
         startBeep(700, 80);
       }
     }
   }
 
-  // BUTTON 4 pressed (edge)
+  // BUTTON 4 - Revised Logic
   if (edge4) {
     btn4PressedWaiting = true;
   }
 
-  // BUTTON 4 long press and release handling
-  if (stable[3] == LOW) {
-    if (held[3] && (currentMillis - pressStart[3] >= LONG_MS) && !forceR6) {
-      // Long press - force R6 ON regardless of A2 state
-      forceR6 = true;
+  // Long press detection for Button 4
+  if (stable[3] == LOW && held[3] && !forceR6) {
+    if (currentMillis - pressStart[3] >= LONG_MS) {
+      forceR6 = true; // Enter forced mode
       sendSetState();
-      startBeep(1700, 110);
-      held[3] = false; // suppress further triggers until release
-      btn4PressedWaiting = false; // Prevent short press action after long press
+      startBeep(1700, 110); // Beep for forced on
+      held[3] = false; // Prevent re-triggering
+      btn4PressedWaiting = false; // Cancel short press
       saveStates();
     }
   }
 
-  // BUTTON 4 short press release (only if not handled as long press)
+  // Short press release detection for Button 4
   if (btn4PressedWaiting && stable[3] == HIGH) {
     btn4PressedWaiting = false;
     
-    // If forceR6 is active, short press returns to previous state
     if (forceR6) {
+      // If in forced mode, a short press cancels it
       forceR6 = false;
       sendSetState();
       startBeep(1200, 90);
       saveStates();
     } else {
-      // Toggle reverse mode
-      reverseModeActive = !reverseModeActive;
+      // Toggle between auto (0) and manual off (1) modes
+      reverseLightMode = (reverseLightMode == 0) ? 1 : 0;
       sendSetState();
-      startBeep(1200, 90);
+      // Beep to indicate the new mode
+      if (reverseLightMode == 0) {
+        startBeep(1200, 90); // Auto mode beep
+      } else {
+        startBeep(1400, 90); // Manual off mode beep
+      }
       saveStates();
     }
   }

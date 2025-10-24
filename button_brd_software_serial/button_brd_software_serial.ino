@@ -101,11 +101,19 @@ bool btn2Pending = false;
 const unsigned long BYPASS_BUTTON_DELAY = 500;
 
 // alerts
-int alertMode = 0;
-int alertCount = 0;
-unsigned long alertTimer = 0;
-int alertStep = 0;
 const unsigned long ALERT_UNIT_MS = 200;
+
+// Alert tracking for Headlights (A0) + Door (A1)
+bool prevHeadlightDoorCombo = false;
+int headlightDoorAlertCount = 0;
+unsigned long headlightDoorAlertTimer = 0;
+int headlightDoorAlertStep = 0;
+
+// Alert tracking for Door (A1) + Power (A3)
+bool prevDoorPowerCombo = false;
+int doorPowerAlertCount = 0;
+unsigned long doorPowerAlertTimer = 0;
+int doorPowerAlertStep = 0;
 
 // scheduled second beep for blocked events
 unsigned long schedSecondBeep = 0;
@@ -248,65 +256,84 @@ void loop() {
   bool doorOn = (a1 >= DOOR_TH);
   bool revOn  = (a2 >= REV_TH);
   bool pwrOn  = (a3 >= PWR_TH);
+  bool voltageOk = (a3 >= 204); // Approximately 10V on 12V system (10/12 * 255 ≈ 212)
 
   // Apply R6 mode based on settings
   if (forceR6) {
-    desiredState |= 0x20; // R6 ON
+    desiredState |= 0x20; // R6 ON (forced)
   } else if (reverseLightMode == 0) { // Auto mode
     if (revOn) {
-      desiredState |= 0x20;
+      desiredState |= 0x20; // R6 ON when reverse light detected
     } else {
-      desiredState &= ~0x20;
+      desiredState &= ~0x20; // R6 OFF when no reverse light
     }
-  } else { // Manual off mode
-    desiredState &= ~0x20;
+  } else { // Manual off mode (1)
+    desiredState &= ~0x20; // R6 OFF regardless
   }
 
-  // alerts: set mode when conditions start
-  if (headOn && doorOn) {
-    if (alertMode != 1) { 
-      alertMode = 1; 
-      alertCount = 0; 
-      alertStep = 0; 
-      alertTimer = 0; 
+  // Send state update if R6 changed due to auto mode
+  {
+    static uint8_t lastDesiredState = 0;
+    if ((desiredState & 0x20) != (lastDesiredState & 0x20)) {
+      sendSetState();
+      lastDesiredState = desiredState;
     }
-  } else if (!headOn && doorOn && pwrOn) {
-    if (alertMode != 2) { 
-      alertMode = 2; 
-      alertCount = 0; 
-      alertStep = 0; 
-      alertTimer = 0; 
-    }
-  } else {
-    alertMode = 0;
-    alertCount = 0;
-    alertStep = 0;
-    alertTimer = 0;
   }
 
-  // run alert patterns non-blocking
-  if (alertMode != 0 && alertCount < 5) {
-    if (alertTimer == 0) alertTimer = currentMillis;
-    if (currentMillis - alertTimer >= ALERT_UNIT_MS) {
-      alertTimer = currentMillis;
-      if (alertMode == 1) {
-        if (alertStep < 6) {
-          if ((alertStep % 2) == 0) startBeep(1600, 120);
-          alertStep++;
-        } else {
-          alertStep = 0;
-          alertCount++;
-          alertTimer += ALERT_UNIT_MS * 2;
-        }
-      } else if (alertMode == 2) {
-        if (alertStep < 4) {
-          if ((alertStep % 2) == 0) startBeep(1200, 140);
-          alertStep++;
-        } else {
-          alertStep = 0;
-          alertCount++;
-          alertTimer += ALERT_UNIT_MS * 2;
-        }
+  // ========== ALERT: Headlights (A0) + Door (A1) - 5 beeps, medium tone ==========
+  bool currentHeadlightDoorCombo = (headOn && doorOn && voltageOk);
+  if (currentHeadlightDoorCombo && !prevHeadlightDoorCombo) {
+    // Start alert on the rising edge of the condition
+    headlightDoorAlertCount = 0;
+    headlightDoorAlertStep = 0;
+    headlightDoorAlertTimer = 0;
+  }
+  if (!doorOn) {
+    // Stop alert immediately if door is closed
+    headlightDoorAlertCount = 5;
+  }
+  prevHeadlightDoorCombo = currentHeadlightDoorCombo;
+
+  if (currentHeadlightDoorCombo && headlightDoorAlertCount < 5) {
+    if (headlightDoorAlertTimer == 0) headlightDoorAlertTimer = currentMillis;
+    if (currentMillis - headlightDoorAlertTimer >= ALERT_UNIT_MS) {
+      headlightDoorAlertTimer = currentMillis;
+      if (headlightDoorAlertStep < 10) {
+        if ((headlightDoorAlertStep % 2) == 0) startBeep(1100, 110);
+        headlightDoorAlertStep++;
+      } else {
+        headlightDoorAlertStep = 0;
+        headlightDoorAlertCount++;
+        headlightDoorAlertTimer += ALERT_UNIT_MS * 1;
+      }
+    }
+  }
+
+  // ========== ALERT: Door (A1) + Power (A3) - 6 beeps, low tone ==========
+  bool currentDoorPowerCombo = (doorOn && pwrOn && voltageOk);
+  if (currentDoorPowerCombo && !prevDoorPowerCombo) {
+    // Start alert on the rising edge of the condition
+    doorPowerAlertCount = 0;
+    doorPowerAlertStep = 0;
+    doorPowerAlertTimer = 0;
+  }
+  if (!doorOn) {
+    // Stop alert immediately if door is closed
+    doorPowerAlertCount = 6;
+  }
+  prevDoorPowerCombo = currentDoorPowerCombo;
+
+  if (currentDoorPowerCombo && doorPowerAlertCount < 6) {
+    if (doorPowerAlertTimer == 0) doorPowerAlertTimer = currentMillis;
+    if (currentMillis - doorPowerAlertTimer >= ALERT_UNIT_MS) {
+      doorPowerAlertTimer = currentMillis;
+      if (doorPowerAlertStep < 12) {
+        if ((doorPowerAlertStep % 2) == 0) startBeep(800, 100);
+        doorPowerAlertStep++;
+      } else {
+        doorPowerAlertStep = 0;
+        doorPowerAlertCount++;
+        doorPowerAlertTimer += ALERT_UNIT_MS * 1;
       }
     }
   }

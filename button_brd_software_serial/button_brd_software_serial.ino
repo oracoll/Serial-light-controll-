@@ -47,7 +47,7 @@ const int EEPROM_FORCE_R5 = 1;
 const int EEPROM_FORCE_R6 = 2;
 const int EEPROM_DESIRED_STATE = 3;
 const int EEPROM_FIRST_PRESS = 4;
-const int EEPROM_R6_MODE = 5; // 0=auto, 1=forced off, 2=forced on
+const int EEPROM_REVERSE_MODE_ACTIVE = 5;
 const int EEPROM_CHECKBYTE = 10; // To check if EEPROM was initialized
 
 // timings
@@ -86,7 +86,7 @@ uint8_t desiredState = 0x00; // bits 0..5 => R1..R6
 // force flags
 bool forceR5 = false; // forced roof ON (via long press on btn3)
 bool forceR6 = false; // forced reverse ON (via long press on btn4)
-uint8_t r6Mode = 0; // 0=auto (follow A2), 1=forced off, 2=forced on
+bool reverseModeActive = false; // toggled by btn4 short press
 
 // bypass
 bool bypassMode = false;
@@ -121,11 +121,6 @@ bool flasherLatched = false;
 // LED TX indicator
 unsigned long ledTxUntil = 0;
 
-// Button 4 press counter and timing
-unsigned long btn4LastPress = 0;
-int btn4PressCount = 0;
-const unsigned long BTN4_PRESS_WINDOW = 1000; // 1 second window for double press
-
 // Save states to EEPROM
 void saveStates() {
   EEPROM.update(EEPROM_BYPASS, bypassMode);
@@ -133,7 +128,7 @@ void saveStates() {
   EEPROM.update(EEPROM_FORCE_R6, forceR6);
   EEPROM.update(EEPROM_DESIRED_STATE, desiredState);
   EEPROM.update(EEPROM_FIRST_PRESS, firstPressInBypass);
-  EEPROM.update(EEPROM_R6_MODE, r6Mode);
+  EEPROM.update(EEPROM_REVERSE_MODE_ACTIVE, reverseModeActive);
 }
 
 // Load states from EEPROM
@@ -146,7 +141,7 @@ void loadStates() {
     EEPROM.update(EEPROM_FORCE_R6, 0);
     EEPROM.update(EEPROM_DESIRED_STATE, 0);
     EEPROM.update(EEPROM_FIRST_PRESS, 1);
-    EEPROM.update(EEPROM_R6_MODE, 0);
+    EEPROM.update(EEPROM_REVERSE_MODE_ACTIVE, 0);
     EEPROM.update(EEPROM_CHECKBYTE, 0x55);
     return;
   }
@@ -156,7 +151,7 @@ void loadStates() {
   forceR6 = EEPROM.read(EEPROM_FORCE_R6);
   desiredState = EEPROM.read(EEPROM_DESIRED_STATE);
   firstPressInBypass = EEPROM.read(EEPROM_FIRST_PRESS);
-  r6Mode = EEPROM.read(EEPROM_R6_MODE);
+  reverseModeActive = EEPROM.read(EEPROM_REVERSE_MODE_ACTIVE);
 }
 
 // helper: read & debounce button, return true when a new press (edge LOW) is detected
@@ -265,16 +260,14 @@ void loop() {
   if (forceR6) {
     // Forced ON (long press)
     desiredState |= 0x20; // R6 ON
-  } else if (r6Mode == 1) {
-    // Forced OFF (double press)
-    desiredState &= ~0x20; // R6 OFF
-  } else {
-    // Auto mode (follow A2)
+  } else if (reverseModeActive) {
     if (revOn) {
       desiredState |= 0x20; // R6 ON
     } else {
       desiredState &= ~0x20; // R6 OFF
     }
+  } else {
+    desiredState &= ~0x20; // R6 OFF
   }
 
   // alerts: set mode when conditions start
@@ -511,7 +504,7 @@ void loop() {
       saveStates();
     } else {
       // Normal short press - check interlock conditions
-      if (headOn || bypassMode) {
+      if (headOn) {
         // Headlights on or in bypass - toggle R5
         desiredState ^= 0x10; // toggle R5
         sendSetState();
@@ -526,13 +519,6 @@ void loop() {
   // BUTTON 4 pressed (edge)
   if (edge4) {
     btn4PressedWaiting = true;
-    
-    // Track button 4 press count for double press detection
-    if (currentMillis - btn4LastPress > BTN4_PRESS_WINDOW) {
-      btn4PressCount = 0;
-    }
-    btn4PressCount++;
-    btn4LastPress = currentMillis;
   }
 
   // BUTTON 4 long press and release handling
@@ -540,7 +526,6 @@ void loop() {
     if (held[3] && (currentMillis - pressStart[3] >= LONG_MS) && !forceR6) {
       // Long press - force R6 ON regardless of A2 state
       forceR6 = true;
-      r6Mode = 2; // forced on
       sendSetState();
       startBeep(1700, 110);
       held[3] = false; // suppress further triggers until release
@@ -556,25 +541,15 @@ void loop() {
     // If forceR6 is active, short press returns to previous state
     if (forceR6) {
       forceR6 = false;
-      r6Mode = 0; // back to auto mode
       sendSetState();
       startBeep(1200, 90);
       saveStates();
     } else {
-      // Handle single/double press when not in forced mode
-      if (btn4PressCount == 1) {
-        // Single press - turn on R6 if A2 has 12V (handled automatically in main loop)
-        // Just beep to acknowledge
-        startBeep(1200, 60);
-      } else if (btn4PressCount == 2) {
-        // Double press - force R6 OFF even when A2 has 12V
-        r6Mode = 1; // forced off
-        sendSetState();
-        startBeep(1400, 90); // Different beep for forced off
-        saveStates();
-      }
-      // Reset press count after processing
-      btn4PressCount = 0;
+      // Toggle reverse mode
+      reverseModeActive = !reverseModeActive;
+      sendSetState();
+      startBeep(1200, 90);
+      saveStates();
     }
   }
 
